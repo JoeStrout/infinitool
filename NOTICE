@@ -1,0 +1,15 @@
+infinitool
+Copyright 2026 Joe Strout
+
+This product includes software developed as part of the Python nRF5 OTA DFU
+Controller (https://github.com/daniel-thompson/ota-dfu-python), itself a chain
+of forks of foldedtoad's original utility, licensed under the Apache License,
+Version 2.0.
+
+  - unpacker.py is taken from that project unmodified.
+  - dfu_bleak.py is an original bleak-based implementation of the same Nordic
+    legacy DFU protocol, written against that project's
+    ble_legacy_dfu_controller.py and against InfiniTime's DfuService.cpp.
+
+infinitool.py is original work, released under the same Apache License,
+Version 2.0, so that the whole repository is under one compatible licence.
