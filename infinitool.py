@@ -61,15 +61,19 @@ misleading errors in other clients:
 import argparse
 import asyncio
 import datetime
+import inspect
 import os
 import shlex
 import struct
 import sys
+import textwrap
 
 try:
     from bleak import BleakClient, BleakScanner
+    # BleakGATTProtocolError arrived in bleak 3.0, which is the floor this pins us to.
+    from bleak.exc import BleakError, BleakGATTProtocolError, BleakGATTProtocolErrorCode
 except ImportError:
-    sys.exit("bleak is not installed. Run: pip install bleak")
+    sys.exit("bleak 3.0 or newer is not installed. Run: pip install 'bleak>=3.0'")
 
 # `flash` reuses dfu_bleak.py rather than reimplementing legacy DFU. That module and the
 # unpacker.py it needs live beside this file, but are imported lazily, inside cmd_flash,
@@ -147,36 +151,74 @@ LFS_ERRORS = {
     -36: "NAMETOOLONG — file name too long",
 }
 
-HELP = """\
+# Three distinct GATT codes that all mean the same thing here: the watch will not serve
+# this characteristic to a central it has no valid bond with. InfiniTime requires pairing
+# for the FS, DFU and CTS characteristics, so a mistyped pairing code -- or a half-finished
+# bond still cached by the OS -- surfaces as one of these on the first read, not at connect
+# time, because CoreBluetooth reports a connection long before any encryption is agreed.
+PAIRING_ERROR_CODES = frozenset({
+    BleakGATTProtocolErrorCode.INSUFFICIENT_AUTHENTICATION,
+    BleakGATTProtocolErrorCode.INSUFFICIENT_AUTHORIZATION,
+    BleakGATTProtocolErrorCode.INSUFFICIENT_ENCRYPTION,
+})
+
+# How to drop the stale bond, per platform. The pairing lives on the machine, not (only)
+# on the watch, so re-running this tool alone will keep failing the same way.
+FORGET_DEVICE = {
+    "darwin": "System Settings -> Bluetooth, click the (i) beside InfiniTime, "
+              "then 'Forget This Device'",
+    "linux": "bluetoothctl remove ADDRESS",
+    "win32": "Settings -> Bluetooth & devices -> the watch -> Remove device",
+}
+
+HELP_PREAMBLE = """\
 Paths refer to the remote (device) filesystem unless prefixed with ! (local), as in ftp/sftp.
-
-  ls [-r] [PATH]        list a directory on the device (default /)
-                          ls /images                        on the device
-                          ls !                              local working directory
-                          ls !../../build/src/resources     any local path
-  cp SRC DST            copy a file; exactly one side must be local (!)
-                          cp !fuji.bin /images/fuji.bin     upload
-                          cp /fonts/teko.bin !teko.bin      download
-                          cp !fuji.bin /images/             keep the local basename
-  rm PATH               delete a file on the watch
-  mkdir PATH            create a directory on the watch
-  df                    show free space on the watch
-
-  time                  show the watch clock, and its drift from this machine
-  time set              set the watch clock (and time zone) from this machine
-                          date is an alias for time
-  info                  firmware version, battery, clock, filesystem
-  flash FILE            reflash the firmware from a DFU zip, after confirming
-                          flash !pinetime-mcuboot-app-dfu-1.16.0.zip
-                          the watch reboots when it finishes, ending the session
-
-  help                  this text
-  exit                  quit (Ctrl-D also works)
+Run 'help COMMAND' for more about one command.
 """
 
 
 class FsError(Exception):
     pass
+
+
+def describe_ble_error(exc):
+    """Explain a bleak exception in terms of what to do about it.
+
+    Only the pairing failures get a real explanation; anything else falls back to bleak's
+    own text, which is usually specific enough.
+    """
+    # BleakGATTProtocolError stringifies as its whole args tuple, code included, which
+    # reads badly in a message. The last arg is the human-readable half.
+    detail = exc.args[-1] if exc.args and isinstance(exc.args[-1], str) else str(exc)
+
+    if isinstance(exc, BleakGATTProtocolError) and exc.code in PAIRING_ERROR_CODES:
+        forget = FORGET_DEVICE.get(
+            sys.platform, "remove the watch from this machine's Bluetooth settings"
+        )
+        return (
+            f"the watch refused the request -- {detail}.\n"
+            "  The Bluetooth pairing is missing or was not accepted. Usually the pairing code\n"
+            "  was mistyped, and this machine now holds a bond the watch will not honour.\n"
+            "  To fix it:\n"
+            "    1. forget the watch on this machine:\n"
+            f"{textwrap.fill(forget, width=88, initial_indent=' ' * 7, subsequent_indent=' ' * 7)}\n"
+            "    2. run infinitool again, and enter the code the watch displays"
+        )
+    return f"Bluetooth error -- {detail}"
+
+
+def command_help(handler):
+    """Split a cmd_* docstring into (usage, summary, details).
+
+    Every command handler documents itself in the same shape: the first line is the
+    usage, the second is the one-line summary `help` lists, and anything after that is
+    the detail `help COMMAND` adds. cleandoc, not dedent: the first line of a docstring
+    carries no indentation, which would defeat dedent's common-prefix calculation.
+    """
+    lines = inspect.cleandoc(handler.__doc__ or "").split("\n")
+    usage = lines[0]
+    summary = lines[1] if len(lines) > 1 else ""
+    return usage, summary, "\n".join(lines[2:]).strip("\n")
 
 
 def describe_status(status):
@@ -525,6 +567,15 @@ class Shell:
         self.fs = fs
         self.device = device
         self.assume_yes = assume_yes
+        # Insertion order is the order `help` lists them in.
+        self.handlers = {
+            "ls": self.cmd_ls, "cp": self.cmd_cp, "rm": self.cmd_rm,
+            "mkdir": self.cmd_mkdir, "df": self.cmd_df,
+            "time": self.cmd_time, "info": self.cmd_info, "flash": self.cmd_flash,
+            "help": self.cmd_help, "exit": self.cmd_exit,
+        }
+        # Dispatchable, but not listed separately by `help`.
+        self.aliases = {"date": "time", "quit": "exit"}
 
     async def run_line(self, line):
         try:
@@ -536,23 +587,21 @@ class Shell:
             return True
 
         command, args = parts[0], parts[1:]
-        handlers = {
-            "ls": self.cmd_ls, "cp": self.cmd_cp, "rm": self.cmd_rm,
-            "mkdir": self.cmd_mkdir, "df": self.cmd_df, "help": self.cmd_help,
-            "time": self.cmd_time, "date": self.cmd_time,
-            "info": self.cmd_info, "flash": self.cmd_flash,
-        }
-        if command in ("exit", "quit"):
-            return False
-        if command not in handlers:
+        handler = self.handlers.get(self.aliases.get(command, command))
+        if handler is None:
             print(f"unknown command {command!r}; try 'help'")
             return True
         try:
-            # A successful flash reboots the watch, which ends the session.
-            if await handlers[command](args) is False:
+            # `exit` returns False, and so does a successful flash: it reboots the watch,
+            # which ends the session either way.
+            if await handler(args) is False:
                 return False
         except FsError as exc:
             print(f"error: {exc}")
+        except BleakError as exc:
+            # Losing the connection mid-session is not recoverable, but a single refused
+            # request is: report it and stay at the prompt.
+            print(f"error: {describe_ble_error(exc)}")
         except OSError as exc:
             print(f"local error: {exc}")
         return True
@@ -566,10 +615,53 @@ class Shell:
             print()
             return False
 
-    async def cmd_help(self, _args):
-        print(HELP, end="")
+    async def cmd_help(self, args):
+        """help [COMMAND]
+        list the commands, or explain one of them
+
+        With no argument, one line per command. With a command name, that command's
+        usage in full:
+
+          help cp
+          help flash
+        """
+        if not args:
+            print(HELP_PREAMBLE)
+            for name, handler in self.handlers.items():
+                usage, summary, _ = command_help(handler)
+                print(f"  {usage:<22}{summary}")
+            return
+
+        name = self.aliases.get(args[0], args[0])
+        handler = self.handlers.get(name)
+        if handler is None:
+            raise FsError(f"no such command {args[0]!r}; 'help' lists them all")
+        usage, summary, details = command_help(handler)
+        print(f"{usage}\n  {summary}")
+        if details:
+            print(f"\n{details}")
+
+    async def cmd_exit(self, _args):
+        """exit
+        quit (Ctrl-D also works)
+
+        'quit' is an alias. A flash also ends the session, since the watch reboots.
+        """
+        return False
 
     async def cmd_ls(self, args):
+        """ls [-r] [PATH]
+        list a directory (default /)
+
+        Sizes are in bytes; directories show a dash and a trailing /. With -r, descend
+        into subdirectories, indenting each level. A ! path lists this machine instead,
+        in the same format, and naming a local file just shows its size.
+
+          ls /images                        on the watch
+          ls -r /                           the whole device filesystem
+          ls !                              local working directory
+          ls !../build/src/resources        any local path
+        """
         recursive = "-r" in args
         paths = [a for a in args if not a.startswith("-")]
         path = paths[0] if paths else "/"
@@ -617,6 +709,19 @@ class Shell:
                 self._ls_local(os.path.join(path, item["name"]), recursive, depth + 1)
 
     async def cmd_cp(self, args):
+        """cp SRC DST
+        copy a file; exactly one side must be local (!)
+
+        The ! side says which direction this goes: watch-to-watch and local-to-local are
+        both refused. A DST ending in / (or, downloading, an existing local directory)
+        keeps the source basename. Uploads are verified afterwards by re-listing the
+        parent directory and comparing the size, because the firmware's own write status
+        cannot be trusted (see the notes at the top of this file).
+
+          cp !fuji.bin /images/fuji.bin     upload
+          cp /fonts/teko.bin !teko.bin      download
+          cp !fuji.bin /images/             keep the local basename
+        """
         if len(args) != 2:
             raise FsError("usage: cp SRC DST  (exactly one side prefixed with !)")
         src, dst = args
@@ -648,6 +753,14 @@ class Shell:
             print(f"\n  wrote {len(content)} B locally")
 
     async def cmd_rm(self, args):
+        """rm PATH
+        delete a file on the watch
+
+        There is no recursive form and no confirmation. The firmware deletes through
+        lfs_remove, so an empty directory can be removed this way too; a directory with
+        anything in it fails with NOTEMPTY. Local files are refused outright — use your
+        own shell for those.
+        """
         if len(args) != 1:
             raise FsError("usage: rm PATH")
         if is_local(args[0]):
@@ -656,6 +769,12 @@ class Shell:
         print(f"deleted {args[0]}")
 
     async def cmd_mkdir(self, args):
+        """mkdir PATH
+        create a directory on the watch
+
+        One level at a time: the parent has to exist already, and an existing path
+        fails with EXIST.
+        """
         if len(args) != 1:
             raise FsError("usage: mkdir PATH")
         if is_local(args[0]):
@@ -664,10 +783,29 @@ class Shell:
         print(f"created {args[0]}")
 
     async def cmd_df(self, _args):
+        """df
+        show free space on the watch
+
+        Free space is not something the protocol reports directly: this asks by starting
+        an oversized write to a scratch path, reading the free figure out of the reply,
+        then deleting the file (see FileSystem.freespace). Nothing is ever written to it.
+        """
         free = await self.fs.freespace()
         print(f"{free} bytes free ({free / 1024:.1f} KiB)")
 
     async def cmd_time(self, args):
+        """time [set]
+        show the watch clock and its drift, or set it from this machine
+
+        'date' is an alias. Plain 'time' also reports the watch's UTC offset. 'time set'
+        writes the time zone first, then the clock, always from this machine's current
+        time -- there is no way to pass a time in -- and reads it back afterwards, since
+        the write is unacknowledged above the GATT layer.
+
+        The whole UTC offset goes into the time zone field with DST left at zero. The
+        firmware only ever uses the sum of the two, so this reads back correctly, but a
+        watch set this way reports no separate DST hour.
+        """
         if args and args[0] == "set":
             if len(args) > 1:
                 raise FsError("usage: time set  (the clock is always taken from this machine)")
@@ -690,6 +828,14 @@ class Shell:
                   f"{f' (includes {dst.seconds // 3600}h DST)' if dst else ''}")
 
     async def cmd_info(self, _args):
+        """info
+        firmware version, battery, clock, filesystem and connection
+
+        A summary of everything readable in one go: the Device Information strings,
+        battery percentage, the clock with its drift from this machine, the BLE
+        filesystem version with free space, and the negotiated MTU with the read and
+        write chunk sizes derived from it.
+        """
         ident = await self.device.identity()
         battery = await self.device.battery()
 
@@ -709,6 +855,20 @@ class Shell:
               f"{self.fs.write_chunk} B writes")
 
     async def cmd_flash(self, args):
+        """flash FILE
+        reflash the firmware from a DFU zip, after confirming
+
+        FILE is a *-dfu-*.zip package, always local, so the ! prefix is optional here.
+        The transfer is Nordic legacy DFU over the connection this session already
+        holds; the running firmware serves it, so the watch does not need to be put into
+        bootloader mode first. It reboots when the flash finishes, which ends the
+        session. Under -c, the confirmation prompt needs -y.
+
+        The new image is NOT yet validated after the reboot: on the watch, go to quick
+        settings -> cog -> Firmware and validate it, or the next reset rolls back.
+
+          flash !pinetime-mcuboot-app-dfu-1.16.0.zip
+        """
         if len(args) != 1:
             raise FsError("usage: flash FILE  (a *-dfu-*.zip package)")
         # The zip can only ever be local, so the ! prefix is optional here.
@@ -856,6 +1016,8 @@ def main():
         asyncio.run(main_async(args))
     except FsError as exc:
         sys.exit(f"Error: {exc}")
+    except BleakError as exc:
+        sys.exit(f"Error: {describe_ble_error(exc)}")
     except KeyboardInterrupt:
         sys.exit("\nInterrupted.")
 

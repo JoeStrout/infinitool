@@ -2,23 +2,35 @@
 
 A one-stop management shell for a [PineTime](https://pine64.org/devices/pinetime/)
 smartwatch running [InfiniTime](https://github.com/InfiniTimeOrg/InfiniTime), over
-Bluetooth LE. Files, clock and firmware, in a single connection.
+Bluetooth LE.  It provides the following functionality:
 
-It runs anywhere [bleak](https://github.com/hbldh/bleak) does — CoreBluetooth on macOS,
-BlueZ on Linux, WinRT on Windows — which matters most on macOS, where there is no
-companion app that can manage a PineTime and a browser cannot do it either (Chrome's Web
-Bluetooth blocklist excludes Nordic's legacy DFU service).
+- flash new firmware
+- view/update files ("external resources")
+- get/set time and date
+
+In short: it manages files, clock, and firmware, in a single connection.
+
+It runs anywhere Python and the [bleak](https://github.com/hbldh/bleak) module are available — communicating with the device via CoreBluetooth on macOS, BlueZ on Linux, and WinRT on Windows.
 
 Everything it uses is served by the normal running firmware; the watch never has to be
 put into bootloader mode.
 
-## Install
+## Prerequisites
+
+You will need a standard Python (3.10+) installation, and [bleak](https://github.com/hbldh/bleak):
 
 ```sh
 pip install bleak
 ```
 
-## Use
+The 3.10 floor is bleak's, not this tool's. Developed and tested against bleak 3.0.2 on
+Python 3.12 (macOS/CoreBluetooth); Linux and Windows should work, as bleak covers BlueZ
+and WinRT, but neither has been tried. Older bleak releases that don't expose
+mtu_size fall back to 23-byte transfers, which works but is slow.
+
+Also, in order to connect successfully to your watch, you will need to go (on the watch) to `Settings` → `Over the Air` and enable "Firmware & files".
+
+## Sample usage
 
 ```
 $ ./infinitool.py
@@ -32,14 +44,14 @@ infinitool> exit
 ```
 
 Plain paths are on the watch; a local path is prefixed with `!`, as in ftp/sftp. Any
-command can also be run non-interactively, and `-c` is repeatable:
+command can also be run non-interactively using `-c`:
 
 ```sh
 ./infinitool.py -c "cp !fuji.bin /images/fuji.bin" -c "ls /images"
 ```
 
-Run `help` at the prompt for the full command list. On the watch, all of this is gated
-behind Settings → "Firmware & files", which must be enabled.
+Run `help` at the prompt for the command list — one line each — or `help COMMAND`
+(e.g. `help cp`) for the detail on any one of them.
 
 ## Files
 
