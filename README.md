@@ -43,8 +43,24 @@ infinitool> flash !pinetime-mcuboot-app-dfu-1.16.0.zip
 infinitool> exit
 ```
 
-Plain paths are on the watch; a local path is prefixed with `!`, as in ftp/sftp. Any
-command can also be run non-interactively using `-c`:
+Plain paths are on the watch; a local path is prefixed with `!`, as in ftp/sftp.
+
+Uploading a `.zip` can mean two different things, so `cp` asks which you want unless
+you say: `cp -c` copies the archive itself to the watch, and `cp -u` unpacks it,
+writing the files inside to the watch and creating directories as needed. So the
+stock external resources are installed with:
+
+```
+infinitool> cp -u !infinitime-resources-1.16.0.zip /
+```
+
+That package is flat and ships a `resources.json` saying where each file belongs, so
+`-u` follows the manifest — `teko.bin` to `/fonts/teko.bin`, `fuji.bin` to
+`/images/fuji.bin` — and offers to delete the obsolete files it lists. A zip with no
+manifest falls back to giving each file the path it has inside the archive. Either
+way the destination is the root it all lands under.
+
+Any command can also be run non-interactively using `-c`:
 
 ```sh
 ./infinitool.py -c "cp !fuji.bin /images/fuji.bin" -c "ls /images"

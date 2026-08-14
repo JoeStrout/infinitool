@@ -24,6 +24,7 @@ Plain paths refer to the remote (device) filesystem. A local path is prefixed wi
     cp !./fuji.bin /images/fuji.bin      upload
     cp /fonts/teko.bin !teko.bin         download
     cp !big.bin /images/                 trailing slash keeps the local basename
+    cp -u !watchfiles.zip /              unpack a zip into the matching directories
 
 Services used, all served by the running firmware (no bootloader mode needed):
 
@@ -62,11 +63,13 @@ import argparse
 import asyncio
 import datetime
 import inspect
+import json
 import os
 import shlex
 import struct
 import sys
 import textwrap
+import zipfile
 
 try:
     from bleak import BleakClient, BleakScanner
@@ -709,7 +712,7 @@ class Shell:
                 self._ls_local(os.path.join(path, item["name"]), recursive, depth + 1)
 
     async def cmd_cp(self, args):
-        """cp SRC DST
+        """cp [-c|-u] SRC DST
         copy a file; exactly one side must be local (!)
 
         The ! side says which direction this goes: watch-to-watch and local-to-local are
@@ -721,18 +724,62 @@ class Shell:
           cp !fuji.bin /images/fuji.bin     upload
           cp /fonts/teko.bin !teko.bin      download
           cp !fuji.bin /images/             keep the local basename
+
+        Uploading a .zip can mean either of two things, so it asks which unless told:
+        -c copies the archive itself to the watch, and -u unpacks it, writing the files
+        inside to the watch and creating the directories they need on the way.
+
+        An InfiniTime resources package (infinitime-resources-x.y.z.zip) is flat and
+        carries a resources.json saying where each file belongs, so -u follows that
+        manifest -- teko.bin to /fonts/teko.bin, fuji.bin to /images/fuji.bin -- and
+        offers to delete the obsolete files it names. Any other zip has no manifest, and
+        there each member keeps the path it has inside the archive instead. DST is the
+        root either lands under, so / gives the paths as written.
+
+        Non-interactively (the tool's own -c), there is nobody to ask, so a zip upload
+        wants -c or -u spelled out; with -y and neither of them it copies as-is, which
+        is what cp has always done.
+
+          cp -u !infinitime-resources-1.16.0.zip /   install the stock resources
+          cp -c !watchfiles.zip /watch.zip           store the archive itself
         """
-        if len(args) != 2:
-            raise FsError("usage: cp SRC DST  (exactly one side prefixed with !)")
-        src, dst = args
+        mode = None
+        positional = []
+        for arg in args:
+            if arg == "-c":
+                mode = "copy"
+            elif arg == "-u":
+                mode = "unpack"
+            elif len(arg) > 1 and arg.startswith("-"):
+                raise FsError(f"unknown option {arg}  (cp takes -c or -u)")
+            else:
+                positional.append(arg)
+
+        if len(positional) != 2:
+            raise FsError("usage: cp [-c|-u] SRC DST  (exactly one side prefixed with !)")
+        src, dst = positional
         if is_local(src) == is_local(dst):
             raise FsError(
                 "exactly one of SRC and DST must be local (!). "
                 "Copying watch-to-watch or local-to-local is not supported."
             )
+        if mode and not is_local(src):
+            raise FsError("-c and -u only apply to uploading a local .zip")
 
         if is_local(src):  # upload
             source = local_path(src)
+            if zipfile.is_zipfile(source):
+                if mode is None:
+                    mode = self.ask_zip_action()
+                    if mode is None:
+                        print("Cancelled.")
+                        return
+                if mode == "unpack":
+                    await self._unpack_zip(source, dst)
+                    return
+            elif mode == "unpack":
+                raise FsError(f"{source} is not a zip archive, so there is nothing to unpack")
+
             target = dst
             if target.endswith("/"):
                 target += os.path.basename(source)
@@ -752,21 +799,247 @@ class Shell:
                 handle.write(content)
             print(f"\n  wrote {len(content)} B locally")
 
-    async def cmd_rm(self, args):
-        """rm PATH
-        delete a file on the watch
+    def ask_zip_action(self):
+        """Ask whether a zip upload means the archive or its contents.
 
-        There is no recursive form and no confirmation. The firmware deletes through
-        lfs_remove, so an empty directory can be removed this way too; a directory with
-        anything in it fails with NOTEMPTY. Local files are refused outright — use your
-        own shell for those.
+        Returns "copy", "unpack", or None to abort. Anything but c/C/u/U aborts, on the
+        principle that the two outcomes are too different to guess at from a typo.
+        Under -y there is nobody to ask, so it takes the reading `cp` has always had.
         """
-        if len(args) != 1:
-            raise FsError("usage: rm PATH")
-        if is_local(args[0]):
+        if self.assume_yes:
+            print("Zip archive: copying it to the device as-is (-y; pass -u to unpack).")
+            return "copy"
+        print("Zip archive: do you want to")
+        print("   [C]opy the zip file to the device as-is, or")
+        print("   [U]npack the archive to multiple files on device?")
+        try:
+            answer = input("==> ").strip()
+        except EOFError:
+            print()
+            return None
+        return {"c": "copy", "u": "unpack"}.get(answer.lower())
+
+    async def _unpack_zip(self, source, dst):
+        """Write the contents of the zip at `source` onto the watch, under `dst`.
+
+        Where each file lands is decided one of two ways. An InfiniTime resources
+        package (infinitime-resources-x.y.z.zip) is flat and carries a resources.json
+        manifest naming the watch path for every file, so that manifest wins; see
+        doc/ExternalResources.md in the firmware tree. Any other zip has no manifest,
+        and there each member simply keeps the path it has inside the archive.
+
+        Either way `dst` is the root it all hangs off, so `/` gives the paths as written.
+        Missing directories are created as we go, one level at a time, because that is
+        all mkdir does. Nothing here is atomic: a failure part way through leaves the
+        files already written in place.
+        """
+        base = dst.rstrip("/")
+        with zipfile.ZipFile(source) as archive:
+            members = [item for item in archive.infolist()
+                       if not item.is_dir()
+                       and not item.filename.startswith("__MACOSX/")
+                       and not os.path.basename(item.filename).startswith("._")]
+            if not members:
+                raise FsError(f"{source} contains no files to unpack")
+
+            manifest = self._read_manifest(archive)
+            if manifest is None:
+                targets = [(item, self._watch_path(base, item.filename)) for item in members]
+                obsolete = []
+                print(f"{source} -> {dst}  ({len(targets)} files)")
+            else:
+                by_name = {item.filename: item for item in members}
+                targets, obsolete = [], manifest["obsolete"]
+                for filename, path in manifest["resources"]:
+                    item = by_name.get(filename)
+                    if item is None:
+                        raise FsError(
+                            f"{source}: resources.json lists {filename}, "
+                            "which is not in the archive"
+                        )
+                    targets.append((item, self._watch_path(base, path)))
+                print(f"{source} -> {dst}  ({len(targets)} files, per resources.json)")
+
+            made = set()
+            for item, target in targets:
+                await self._ensure_dirs(os.path.dirname(target), made)
+                content = archive.read(item)
+                print(f"  {target} ({len(content)} B)")
+                written = await self.fs.write_file(target, content, progress)
+                print(f"\n    verified {written} B on the watch")
+        print(f"unpacked {len(targets)} files")
+
+        if obsolete:
+            # The manifest only says these are no longer needed, so this is the watch
+            # owner's call, not ours: offer it, and leave them alone if declined.
+            print(f"\nresources.json lists {len(obsolete)} obsolete file(s):")
+            for path, since in obsolete:
+                print(f"  {path}{f'  (since {since})' if since else ''}")
+            if self.confirm("Delete them from the watch?"):
+                for path, _since in obsolete:
+                    try:
+                        await self.fs.delete(self._watch_path(base, path))
+                        print(f"  deleted {path}")
+                    except FsError as exc:
+                        # Not being there is the expected case, not a failure.
+                        if "NOENT" not in str(exc):
+                            raise
+                        print(f"  {path} was not there")
+
+    @staticmethod
+    def _read_manifest(archive):
+        """Parse an InfiniTime resources.json, or return None if this is a plain zip.
+
+        Returns {"resources": [(filename, path), ...], "obsolete": [(path, since), ...]}.
+        A resources.json that does not parse is worth complaining about rather than
+        silently falling back to the by-path rule, which would put the whole flat
+        archive in one directory.
+        """
+        names = [name for name in archive.namelist()
+                 if os.path.basename(name) == "resources.json" and "/" not in name.strip("/")]
+        if not names:
+            return None
+        try:
+            data = json.loads(archive.read(names[0]))
+            resources = [(entry["filename"], entry["path"]) for entry in data["resources"]]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise FsError(f"resources.json in this archive is not usable: {exc}")
+        # generate-package.py writes {} here when the firmware build had no obsolete
+        # list, so this is a list only some of the time.
+        entries = data.get("obsolete_files") or []
+        obsolete = [(entry["path"], entry.get("since")) for entry in entries
+                    if isinstance(entry, dict) and entry.get("path")]
+        return {"resources": resources, "obsolete": obsolete}
+
+    @staticmethod
+    def _watch_path(base, raw):
+        """Join a path out of an archive onto `base`, refusing anything that climbs out.
+
+        Manifest paths are absolute (/fonts/teko.bin) and member paths are relative;
+        both are just anchored at `base` here. Neither is trustworthy in principle, and
+        this writes straight into a filesystem, so `..` is refused outright.
+        """
+        parts = [part for part in raw.replace("\\", "/").split("/") if part not in ("", ".")]
+        if ".." in parts:
+            raise FsError(f"refusing to unpack member with unsafe path: {raw}")
+        if not parts:
+            raise FsError(f"refusing to unpack member with empty path: {raw!r}")
+        return f"{base}/{'/'.join(parts)}"
+
+    async def _ensure_dirs(self, directory, made):
+        """mkdir every level of `directory` that is not there yet, remembering which."""
+        parts = [part for part in directory.split("/") if part]
+        path = ""
+        for part in parts:
+            path = f"{path}/{part}"
+            if path in made:
+                continue
+            try:
+                await self.fs.mkdir(path)
+                print(f"  created {path}/")
+            except FsError as exc:
+                # Already there is the common case, and the only one we can carry on from;
+                # a real failure will surface on the write that follows.
+                if "EXIST" not in str(exc):
+                    raise
+            made.add(path)
+
+    async def cmd_rm(self, args):
+        """rm [-R] PATH
+        delete a file on the watch, or a whole directory with -R
+
+        Plain rm deletes one thing and does not ask. The firmware deletes through
+        lfs_remove, so an empty directory can be removed this way too; a directory with
+        anything in it fails with NOTEMPTY.
+
+        -R (or -r) empties a directory first and then removes it, walking it depth-first
+        because lfs_remove only ever takes one entry at a time. That walk is also what
+        makes it worth confirming: the count is shown before anything is deleted, and -y
+        answers yes. `rm -R /` is allowed, and empties the watch without removing the
+        root itself, so think twice. Local paths are refused outright -- use your own
+        shell for those.
+
+          rm /images/fuji.bin               one file
+          rm -R /cptest                     the directory and everything under it
+        """
+        recursive = False
+        positional = []
+        for arg in args:
+            if arg in ("-R", "-r"):
+                recursive = True
+            elif len(arg) > 1 and arg.startswith("-"):
+                raise FsError(f"unknown option {arg}  (rm takes -R)")
+            else:
+                positional.append(arg)
+
+        if len(positional) != 1:
+            raise FsError("usage: rm [-R] PATH")
+        path = positional[0]
+        if is_local(path):
             raise FsError("rm only deletes on the watch; use your own shell for local files")
-        await self.fs.delete(args[0])
-        print(f"deleted {args[0]}")
+
+        if not recursive:
+            await self.fs.delete(path)
+            print(f"deleted {path}")
+            return
+
+        # -R on a file is not an error anywhere else, and it should not be here either.
+        is_root = not path.strip("/")
+        if not is_root and not await self._is_dir(path):
+            await self.fs.delete(path)
+            print(f"deleted {path}")
+            return
+
+        path = "/" if is_root else path.rstrip("/")
+        files, dirs = await self._walk(path)
+        if not files and not dirs and is_root:
+            print("/ is already empty")
+            return
+
+        count = f"{len(files)} file(s) and {len(dirs)} directory(ies)"
+        print(f"{path} holds {count}." if files or dirs else f"{path} is empty.")
+        if not self.confirm(f"Delete {'everything under ' if is_root else ''}{path}?"):
+            print("Cancelled.")
+            return
+
+        # Depth-first: _walk already ordered the directories deepest-first, and every
+        # file goes before any directory, so nothing is ever removed while non-empty.
+        for target in files + dirs:
+            await self.fs.delete(target)
+            print(f"  deleted {target}")
+        if is_root:
+            print("emptied /")  # lfs has no way to remove the root itself
+        else:
+            await self.fs.delete(path)
+            print(f"deleted {path}")
+
+    async def _is_dir(self, path):
+        """Ask the parent listing whether `path` is a directory. NOENT if it is absent."""
+        parent, _, name = path.rstrip("/").rpartition("/")
+        for item in await self.fs.listdir(parent or "/"):
+            if item["name"] == name:
+                return item["is_dir"]
+        raise FsError(f"{path}: {describe_status(-2)}")
+
+    async def _walk(self, path):
+        """Everything under `path`: (files, directories), directories deepest-first.
+
+        The order is the point -- it is what the caller deletes in, and lfs_remove
+        refuses a directory that still has anything in it.
+        """
+        files, dirs = [], []
+
+        async def visit(directory):
+            for item in await self.fs.listdir(directory):
+                child = f"{directory.rstrip('/')}/{item['name']}"
+                if item["is_dir"]:
+                    await visit(child)
+                    dirs.append(child)  # after its own children, so children go first
+                else:
+                    files.append(child)
+
+        await visit(path)
+        return files, dirs
 
     async def cmd_mkdir(self, args):
         """mkdir PATH
