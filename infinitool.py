@@ -11,6 +11,7 @@ on macOS, BlueZ on Linux, WinRT on Windows.
     infinitool> ls /images
     infinitool> cp !fuji.bin /images/fuji.bin
     infinitool> time set
+    infinitool> notify "Test" "Hello from infinitool"
     infinitool> flash !../../build/output/pinetime-mcuboot-app-dfu-1.16.0.zip
     infinitool> exit
 
@@ -33,6 +34,12 @@ Services used, all served by the running firmware (no bootloader mode needed):
     0x1805 / 0x2a2b    Current Time Service       CurrentTimeService.cpp
     0x180a             Device Information         DeviceInformationService.cpp
     0x180f / 0x2a19    Battery level              BatteryInformationService.cpp
+    0x1811 / 0x2a46    Alert Notification         AlertNotificationService.cpp
+    0x1802 / 0x2a06    Immediate Alert            ImmediateAlertService.cpp
+    0x180d / 0x2a37    Heart rate                 HeartRateService.cpp
+    00030000-...       Motion (steps, accel)      MotionService.cpp
+    00000000-...       Music                      MusicService.cpp
+    00050001-...       Simple weather             SimpleWeatherService.cpp
 
 The `flash` command needs dfu_bleak.py and unpacker.py, which sit beside this file and
 are imported on demand; every other command depends on nothing outside this file.
@@ -54,6 +61,20 @@ misleading errors in other clients:
     (FSService.cpp:292-296); it is not a file.
   - Everything here is gated behind Settings -> "Firmware & files" on the watch. When it
     is Disabled, every request is refused and the version characteristic reads 0, not 4.
+  - The Alert Notification write has a 3-byte header, but only byte 0 (the category) is
+    ever read (AlertNotificationService.cpp:64); the "number of new alerts" byte the SIG
+    spec defines is discarded. Of the text after it, at most 99 bytes survive: the copy
+    length is min(packetLen + 1, 103) - 3 - 1 (AlertNotificationService.cpp:56-63).
+  - Motion, heart rate and battery are the only sensor values BLE exposes, and all three
+    are READ|NOTIFY (MotionService.cpp:37, HeartRateService.cpp:25). There is no write
+    path to the step count -- it lives in MotionController, and nothing in the firmware
+    lets a central set it -- so `info` reports these and no command sets them.
+  - Music and navigation characteristics are flagged READ|WRITE, but OnCommand handles
+    only the write op (MusicService.cpp:128), so reads come back empty rather than
+    echoing what was sent. `music` therefore prints what it sent, not what is stored.
+  - MusicService registers the track-length UUID twice (MusicService.cpp:84-91), so the
+    watch really does advertise two characteristics with the same UUID and bleak will
+    not resolve it by UUID at all; see Device._music_characteristic.
   - Reading the Current Time characteristic returns 10 bytes, but the firmware fills in
     only the first 8 (CurrentTimeService.cpp:57-67): dayofweek and reason are left as
     whatever was on the stack. We parse the date and time and ignore those two fields.
@@ -98,6 +119,87 @@ UUID_SERIAL_NUMBER = "00002a25-0000-1000-8000-00805f9b34fb"
 UUID_FW_REVISION = "00002a26-0000-1000-8000-00805f9b34fb"
 UUID_HW_REVISION = "00002a27-0000-1000-8000-00805f9b34fb"
 UUID_SW_REVISION = "00002a28-0000-1000-8000-00805f9b34fb"
+UUID_NEW_ALERT = "00002a46-0000-1000-8000-00805f9b34fb"
+UUID_ALERT_LEVEL = "00002a06-0000-1000-8000-00805f9b34fb"
+UUID_HEART_RATE = "00002a37-0000-1000-8000-00805f9b34fb"
+
+
+def infinitime_uuid(service, characteristic):
+    """One of InfiniTime's own 128-bit UUIDs, 0000ssss-cccc pattern.
+
+    Every custom service in the firmware is built from the same vendor base by
+    substituting two bytes; see the CharUuid helper at the top of MusicService.cpp,
+    MotionService.cpp and friends.
+    """
+    return f"{service:04x}{characteristic:04x}-78fc-48fe-8e23-433b3a1942d0"
+
+
+UUID_STEP_COUNT = infinitime_uuid(0x0003, 0x0001)
+UUID_MOTION_VALUES = infinitime_uuid(0x0003, 0x0002)
+UUID_WEATHER_DATA = infinitime_uuid(0x0005, 0x0001)
+
+# AlertNotificationService.h:38-49. Only Call is treated specially by the firmware --
+# it raises the incoming-call screen; everything else becomes a plain SimpleAlert.
+ANS_CATEGORIES = {
+    "simple": 0x00,
+    "email": 0x01,
+    "news": 0x02,
+    "call": 0x03,
+    "missed-call": 0x04,
+    "sms": 0x05,
+    "voicemail": 0x06,
+    "schedule": 0x07,
+    "high-priority": 0x08,
+    "im": 0x09,
+}
+
+# See the header note: the firmware copies at most this much of the text that follows
+# the 3-byte header, title and NUL separator included.
+ANS_MAX_TEXT = 99
+
+# ImmediateAlertService::Levels, ImmediateAlertService.h. The watch turns each of these
+# into a notification reading "Alert : None" / "Mild" / "High".
+ALERT_LEVELS = {"none": 0x00, "mild": 0x01, "high": 0x02}
+
+# MusicService.cpp:38-49, with the encoding each characteristic's write path expects
+# (MusicService.cpp:127-180). Note the numbers are big-endian there, unlike every other
+# multi-byte field in this firmware.
+MUSIC_FIELDS = {
+    "status": (infinitime_uuid(0x0000, 0x0002), "flag"),
+    "artist": (infinitime_uuid(0x0000, 0x0003), "str"),
+    "track": (infinitime_uuid(0x0000, 0x0004), "str"),
+    "album": (infinitime_uuid(0x0000, 0x0005), "str"),
+    "position": (infinitime_uuid(0x0000, 0x0006), "u32"),
+    "length": (infinitime_uuid(0x0000, 0x0007), "u32"),
+    "number": (infinitime_uuid(0x0000, 0x0008), "u32"),
+    "total": (infinitime_uuid(0x0000, 0x0009), "u32"),
+    "speed": (infinitime_uuid(0x0000, 0x000A), "speed"),
+    "repeat": (infinitime_uuid(0x0000, 0x000B), "flag"),
+    "shuffle": (infinitime_uuid(0x0000, 0x000C), "flag"),
+}
+
+# MusicService.cpp:51. Longer strings are accepted but the tail is replaced with "...".
+MUSIC_MAX_STRING = 40
+
+# SimpleWeatherService::Icons, SimpleWeatherService.h:55-65.
+WEATHER_ICONS = {
+    "sun": 0,
+    "clouds-sun": 1,
+    "clouds": 2,
+    "broken-clouds": 3,
+    "heavy-shower": 4,
+    "rain": 5,
+    "thunderstorm": 6,
+    "snow": 7,
+    "smog": 8,
+}
+
+WEATHER_MAX_FORECAST_DAYS = 5      # SimpleWeatherService::MaxNbForecastDays
+WEATHER_LOCATION_SIZE = 32         # SimpleWeatherService::Location, minus its terminator
+
+# 1024 raw units = 1g: the BMA421 driver rescales to "binary milli-g" before the values
+# reach MotionController (Bma421.cpp:118-123).
+ACCEL_UNITS_PER_G = 1024
 
 # CtsCurrentTimeData, CurrentTimeService.h:36-47. Ten bytes, little endian.
 CTS_FORMAT = "<HBBBBBBBB"
@@ -238,6 +340,96 @@ def local_path(path):
     # A bare "!" means the current local directory, which makes `ls !` and
     # `cp /fonts/teko.bin !` do the obvious thing.
     return os.path.expanduser(path[1:]) or "."
+
+
+def parse_options(args, known, command):
+    """Parse a flat list of `--key value` pairs into a dict, rejecting anything else.
+
+    Small enough not to want argparse, which would want to exit the process on a bad
+    option rather than hand back an error the shell can print and carry on from.
+    """
+    options = {}
+    rest = list(args)
+    while rest:
+        key = rest.pop(0)
+        if key not in known:
+            raise FsError(f"unknown option {key!r} for {command}; one of: "
+                          f"{', '.join(sorted(known))}")
+        if not rest:
+            raise FsError(f"{key} needs a value")
+        options[key] = rest.pop(0)
+    return options
+
+
+def parse_temperature(text):
+    """A temperature in hundredths of a degree Celsius, which is the wire format.
+
+    Bare numbers are Celsius; a C or F suffix says which, so `70F` works.
+    """
+    value = text.strip()
+    scale = "C"
+    if value and value[-1].upper() in ("C", "F"):
+        value, scale = value[:-1], value[-1].upper()
+    try:
+        degrees = float(value)
+    except ValueError:
+        raise FsError(f"bad temperature {text!r}; expected a number, optionally with "
+                      f"a C or F suffix")
+    if scale == "F":
+        degrees = (degrees - 32) * 5 / 9
+    hundredths = round(degrees * 100)
+    # int16 on the wire (SimpleWeatherService.cpp:76), so the range is +/-327.67 C.
+    if not -32768 <= hundredths <= 32767:
+        raise FsError(f"temperature {text!r} is outside the range the watch can store")
+    return hundredths
+
+
+def parse_weather_icon(name):
+    icon = WEATHER_ICONS.get(name.strip().lower())
+    if icon is None:
+        raise FsError(f"unknown weather icon {name!r}; one of: {', '.join(WEATHER_ICONS)}")
+    return icon
+
+
+def parse_minutes(text):
+    """An HH:MM local time as minutes into the day, which is what the wire format wants."""
+    try:
+        hours, minutes = text.split(":")
+        total = int(hours) * 60 + int(minutes)
+    except ValueError:
+        raise FsError(f"bad time {text!r}; expected HH:MM")
+    if not 0 <= total < 1440:
+        raise FsError(f"time {text!r} is not within a single day")
+    return total
+
+
+def parse_music_value(field, text):
+    """Turn one `music FIELD VALUE` argument into the type that field's writer wants."""
+    kind = MUSIC_FIELDS[field][1]
+    if kind == "str":
+        return text
+    if kind == "flag":
+        lowered = text.strip().lower()
+        if lowered in ("play", "playing", "on", "yes", "true", "1"):
+            return True
+        if lowered in ("pause", "paused", "stop", "off", "no", "false", "0"):
+            return False
+        raise FsError(f"bad value {text!r} for {field}; expected play/pause (or on/off)")
+    if kind == "u32":
+        try:
+            value = int(text)
+        except ValueError:
+            raise FsError(f"bad value {text!r} for {field}; expected a whole number")
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise FsError(f"{field} must be between 0 and {0xFFFFFFFF}")
+        return value
+    try:
+        speed = float(text)
+    except ValueError:
+        raise FsError(f"bad value {text!r} for speed; expected a number such as 1.5")
+    if not 0 <= speed * 100 <= 0xFFFFFFFF:
+        raise FsError("speed is out of range")
+    return speed
 
 
 def human(size):
@@ -477,6 +669,130 @@ class Device:
     async def firmware_version(self):
         return await self._read_str(UUID_FW_REVISION)
 
+    # -- read-only sensors -------------------------------------------------------
+    #
+    # All three are READ|NOTIFY with no write path anywhere in the firmware, so they
+    # can be reported but not set. Each returns None if the characteristic is missing
+    # (an older build) or the read is refused, which keeps `info` printing the rest.
+
+    async def steps(self):
+        """Steps counted today, as uint32 (MotionService.cpp:62-69)."""
+        try:
+            raw = await self.client.read_gatt_char(UUID_STEP_COUNT)
+            return struct.unpack("<I", raw[:4])[0]
+        except Exception:
+            return None
+
+    async def motion(self):
+        """Latest accelerometer sample as (x, y, z) in binary milli-g."""
+        try:
+            raw = await self.client.read_gatt_char(UUID_MOTION_VALUES)
+            return struct.unpack("<hhh", raw[:6])
+        except Exception:
+            return None
+
+    async def heart_rate(self):
+        """Last heart rate in bpm, or None. Zero means the sensor is not running.
+
+        The characteristic is the standard two-byte HRM measurement, but the firmware
+        always sends flags = 0 and a uint8 value (HeartRateService.cpp:51).
+        """
+        try:
+            raw = await self.client.read_gatt_char(UUID_HEART_RATE)
+            return raw[1] if len(raw) >= 2 else None
+        except Exception:
+            return None
+
+    # -- notifications and alerts ------------------------------------------------
+
+    async def send_notification(self, category, title, body):
+        """Push a notification. Returns the text bytes that actually fit.
+
+        Layout is category, count, separator, then "title\\0body" -- but the firmware
+        reads only the category out of that header (see the notes at the top of this
+        file), so the other two bytes are sent as zero.
+        """
+        text = title.encode() + b"\x00" + body.encode() if body else title.encode()
+        text = text[:ANS_MAX_TEXT]
+        await self.client.write_gatt_char(
+            UUID_NEW_ALERT, bytes([category, 0, 0]) + text, response=True
+        )
+        return text
+
+    async def send_alert(self, level):
+        """Immediate Alert Service, one byte. Write-without-response is all it accepts."""
+        await self.client.write_gatt_char(UUID_ALERT_LEVEL, bytes([level]), response=False)
+
+    # -- music -------------------------------------------------------------------
+
+    def _music_characteristic(self, uuid):
+        """The lowest-handle characteristic with this UUID.
+
+        Everywhere else a UUID identifies one characteristic, but MusicService registers
+        the track-length UUID twice -- characteristicDefinition[6] and [7] are both
+        msTotalLengthCharUuid (MusicService.cpp:84-91), evidently a copy-paste for what
+        should have been a distinct field. bleak refuses to resolve a duplicated UUID
+        and asks for a handle instead, so `music length` has to pick one. Both entries
+        land in the same firmware variable, so the first will do.
+        """
+        matches = [characteristic
+                   for characteristic in self.client.services.characteristics.values()
+                   if characteristic.uuid == uuid]
+        if not matches:
+            raise FsError(f"this firmware does not serve characteristic {uuid}")
+        return min(matches, key=lambda characteristic: characteristic.handle)
+
+    async def set_music(self, field, value):
+        """Write one Music Service characteristic. Returns what was sent, for display."""
+        uuid, kind = MUSIC_FIELDS[field]
+        if kind == "str":
+            payload = value.encode()[:MUSIC_MAX_STRING]
+            shown = payload.decode(errors="replace")
+        elif kind == "flag":
+            payload = bytes([1 if value else 0])
+            words = ("play", "pause") if field == "status" else ("on", "off")
+            shown = words[0] if value else words[1]
+        elif kind == "u32":
+            payload = struct.pack(">I", value)     # big-endian, MusicService.cpp:166
+            shown = str(value)
+        else:                                       # speed, a float sent as hundredths
+            payload = struct.pack(">I", round(value * 100))
+            shown = f"{value:g}x"
+        await self.client.write_gatt_char(self._music_characteristic(uuid), payload,
+                                          response=True)
+        return shown
+
+    # -- weather -----------------------------------------------------------------
+
+    async def send_weather_current(self, temperature, minimum, maximum, icon,
+                                   location, sunrise, sunset):
+        """Message type 0, version 1 (SimpleWeatherService.cpp:39-84).
+
+        Temperatures are centi-degrees Celsius; sunrise and sunset are minutes into the
+        local day, or -1 for unknown. The firmware drops the whole pair if it is not
+        internally consistent, so it validates rather than silently ignoring bad input.
+        """
+        payload = struct.pack(
+            "<BBQhhh32sBhh",
+            0,                                      # CurrentWeather
+            1,                                      # version, the one with sun times
+            int(datetime.datetime.now().timestamp()),
+            temperature, minimum, maximum,
+            location.encode()[:WEATHER_LOCATION_SIZE],
+            icon,
+            sunrise, sunset,
+        )
+        await self.client.write_gatt_char(UUID_WEATHER_DATA, payload, response=True)
+
+    async def send_weather_forecast(self, days):
+        """Message type 1, version 0. days is a list of (min, max, icon), at most five."""
+        payload = struct.pack(
+            "<BBQB", 1, 0, int(datetime.datetime.now().timestamp()), len(days)
+        )
+        for minimum, maximum, icon in days:
+            payload += struct.pack("<hhB", minimum, maximum, icon)
+        await self.client.write_gatt_char(UUID_WEATHER_DATA, payload, response=True)
+
     async def identity(self):
         return {
             "manufacturer": await self._read_str(UUID_MANUFACTURER),
@@ -574,7 +890,10 @@ class Shell:
         self.handlers = {
             "ls": self.cmd_ls, "cp": self.cmd_cp, "rm": self.cmd_rm,
             "mkdir": self.cmd_mkdir, "df": self.cmd_df,
-            "time": self.cmd_time, "info": self.cmd_info, "flash": self.cmd_flash,
+            "time": self.cmd_time, "info": self.cmd_info,
+            "notify": self.cmd_notify, "alert": self.cmd_alert,
+            "music": self.cmd_music, "weather": self.cmd_weather,
+            "flash": self.cmd_flash,
             "help": self.cmd_help, "exit": self.cmd_exit,
         }
         # Dispatchable, but not listed separately by `help`.
@@ -632,7 +951,7 @@ class Shell:
             print(HELP_PREAMBLE)
             for name, handler in self.handlers.items():
                 usage, summary, _ = command_help(handler)
-                print(f"  {usage:<22}{summary}")
+                print(f"  {usage:<30}{summary}")
             return
 
         name = self.aliases.get(args[0], args[0])
@@ -1122,10 +1441,211 @@ class Shell:
             print(f"clock        {watch_time:%Y-%m-%d %H:%M:%S}  ({describe_drift(watch_time)})")
         except FsError as exc:
             print(f"clock        unavailable: {exc}")
+        steps = await self.device.steps()
+        if steps is not None:
+            print(f"steps        {steps} today")
+        motion = await self.device.motion()
+        if motion is not None:
+            x, y, z = motion
+            magnitude = (x * x + y * y + z * z) ** 0.5 / ACCEL_UNITS_PER_G
+            print(f"motion       x {x:>6}  y {y:>6}  z {z:>6}  "
+                  f"(binary milli-g; |a| = {magnitude:.2f} g)")
+        heart_rate = await self.device.heart_rate()
+        if heart_rate is not None:
+            # The characteristic reads back 0 whenever the sensor is idle, which is most
+            # of the time: InfiniTime only runs it in the Heart Rate app, or continuously
+            # if that has been switched on in Settings.
+            print(f"heart rate   {heart_rate} bpm" if heart_rate
+                  else "heart rate   not measuring (start the Heart Rate app on the watch)")
         print(f"filesystem   BLE FS v{await self.fs.version()}, "
               f"{await self.fs.freespace()} bytes free")
         print(f"connection   MTU {self.fs.mtu}: {self.fs.read_chunk} B reads, "
               f"{self.fs.write_chunk} B writes")
+
+    async def cmd_notify(self, args):
+        """notify [-c CAT] TITLE [BODY]
+        send a notification to the watch
+
+        The watch shows TITLE in bold with BODY beneath it, and keeps it in the
+        notification list. Together they may total 99 bytes; anything past that is
+        dropped by the firmware, so this truncates and says so.
+
+        CAT defaults to 'simple'. Only 'call' behaves differently -- it raises the
+        incoming-call screen with its accept and reject buttons instead of a plain
+        notification. Every other category is stored as a simple alert, so the choice is
+        cosmetic, but the full set the protocol defines is accepted:
+
+          simple  email  news  call  missed-call  sms  voicemail  schedule
+          high-priority  im
+
+          notify "Test" "Hello from infinitool"
+          notify -c sms "Alice" "on my way"
+          notify -c call "Bob Smith"
+        """
+        category_name = "simple"
+        positional = []
+        rest = list(args)
+        while rest:
+            arg = rest.pop(0)
+            if arg in ("-c", "--category"):
+                if not rest:
+                    raise FsError("-c needs a category name")
+                category_name = rest.pop(0)
+            elif len(arg) > 1 and arg.startswith("-"):
+                raise FsError(f"unknown option {arg}  (notify takes -c CATEGORY)")
+            else:
+                positional.append(arg)
+
+        if not 1 <= len(positional) <= 2:
+            raise FsError("usage: notify [-c CATEGORY] TITLE [BODY]")
+        category = ANS_CATEGORIES.get(category_name.lower())
+        if category is None:
+            raise FsError(f"unknown category {category_name!r}; one of: "
+                          f"{', '.join(ANS_CATEGORIES)}")
+
+        title = positional[0]
+        body = positional[1] if len(positional) > 1 else ""
+        wanted = len(title.encode()) + (1 + len(body.encode()) if body else 0)
+        sent = await self.device.send_notification(category, title, body)
+        print(f"sent {category_name} notification ({len(sent)} bytes of text)")
+        if wanted > len(sent):
+            print(f"  note: truncated to {ANS_MAX_TEXT} bytes, which is all the "
+                  f"firmware copies")
+
+    async def cmd_alert(self, args):
+        """alert [none|mild|high]
+        buzz the watch with an Immediate Alert (default high)
+
+        The shortest way to make the watch react. The firmware turns the level into a
+        notification reading 'Alert : High' and vibrates; 'none' pushes 'Alert : None'
+        and is only useful for testing that path. The write is unacknowledged -- the
+        characteristic is write-without-response -- so nothing is read back.
+        """
+        if len(args) > 1:
+            raise FsError("usage: alert [none|mild|high]")
+        name = (args[0] if args else "high").lower()
+        level = ALERT_LEVELS.get(name)
+        if level is None:
+            raise FsError(f"unknown level {name!r}; one of: {', '.join(ALERT_LEVELS)}")
+        await self.device.send_alert(level)
+        print(f"sent {name} alert")
+
+    async def cmd_music(self, args):
+        """music FIELD VALUE ...
+        set what the watch's Music app displays
+
+        Populates the Music screen as a phone would. Nothing here plays anything: the
+        watch is the remote, and these are the fields it shows. Each pair is written to
+        its own characteristic, in the order given.
+
+          track artist album      text, truncated by the firmware at 40 bytes
+          status                  play or pause
+          position length         seconds, as whole numbers
+          number total            track number, and how many are in the queue
+          speed                   playback rate, e.g. 1 or 1.5
+          repeat shuffle          on or off
+
+        The watch cannot be read back -- these characteristics return nothing on a read
+        (see the notes at the top of this file) -- so what is printed is what was sent.
+
+          music track "Blue Monday" artist "New Order" status play
+          music length 450 position 12
+          music status pause
+        """
+        if not args or len(args) % 2:
+            raise FsError("usage: music FIELD VALUE [FIELD VALUE ...]  "
+                          f"(fields: {', '.join(MUSIC_FIELDS)})")
+
+        pairs = []
+        for field, value in zip(args[::2], args[1::2]):
+            field = field.lower()
+            if field not in MUSIC_FIELDS:
+                raise FsError(f"unknown field {field!r}; one of: {', '.join(MUSIC_FIELDS)}")
+            pairs.append((field, parse_music_value(field, value)))
+
+        for field, value in pairs:
+            shown = await self.device.set_music(field, value)
+            print(f"  {field:<9} {shown}")
+            if MUSIC_FIELDS[field][1] == "str" and len(value.encode()) > MUSIC_MAX_STRING:
+                print(f"    note: truncated to {MUSIC_MAX_STRING} bytes, the firmware's limit")
+
+    async def cmd_weather(self, args):
+        """weather TEMP [OPTIONS]
+        send weather (or, with 'forecast', a five-day outlook) to the watch
+
+            weather TEMP [OPTIONS]
+            weather forecast MIN/MAX/ICON [...]
+
+        Temperatures are Celsius unless suffixed with F (as in 70F), and go over the
+        air as hundredths of a degree. ICON is one of:
+
+          sun  clouds-sun  clouds  broken-clouds  heavy-shower  rain  thunderstorm
+          snow  smog
+
+        The first form sends current conditions, timestamped now. Options:
+
+          --min TEMP --max TEMP     the day's range (default: TEMP itself)
+          --icon NAME               default sun
+          --location NAME           up to 32 bytes, default 'Testville'
+          --sunrise HH:MM           local time, both must be given, sunrise first
+          --sunset HH:MM            the firmware rejects the pair if they disagree
+
+        The second form sends a forecast instead, one MIN/MAX/ICON per day, up to five
+        days starting tomorrow.
+
+          weather 21.5
+          weather 70F --min 55F --max 74F --icon rain --location Portland
+          weather 18 --sunrise 06:12 --sunset 20:44
+          weather forecast 12/19/rain 14/22/clouds-sun 15/24/sun
+        """
+        if not args:
+            raise FsError("usage: weather TEMP [options]  |  weather forecast DAY ...")
+
+        if args[0] == "forecast":
+            days = args[1:]
+            if not days:
+                raise FsError("usage: weather forecast MIN/MAX/ICON [...]")
+            if len(days) > WEATHER_MAX_FORECAST_DAYS:
+                raise FsError(f"the watch stores at most {WEATHER_MAX_FORECAST_DAYS} "
+                              f"forecast days; {len(days)} given")
+            parsed = []
+            for day in days:
+                fields = day.split("/")
+                if len(fields) != 3:
+                    raise FsError(f"bad forecast day {day!r}; expected MIN/MAX/ICON")
+                parsed.append((parse_temperature(fields[0]), parse_temperature(fields[1]),
+                               parse_weather_icon(fields[2])))
+            await self.device.send_weather_forecast(parsed)
+            print(f"sent a {len(parsed)}-day forecast")
+            return
+
+        temperature = parse_temperature(args[0])
+        options = parse_options(
+            args[1:], {"--min", "--max", "--icon", "--location", "--sunrise", "--sunset"},
+            "weather",
+        )
+        minimum = parse_temperature(options["--min"]) if "--min" in options else temperature
+        maximum = parse_temperature(options["--max"]) if "--max" in options else temperature
+        if minimum > maximum:
+            raise FsError("--min is above --max")
+        icon = parse_weather_icon(options.get("--icon", "sun"))
+        location = options.get("--location", "Testville")
+
+        # The firmware validates the pair together and throws both away if either is
+        # missing or they are out of order (SimpleWeatherService.cpp:60-72), so catch
+        # that here rather than leaving the watch showing nothing and no reason why.
+        if ("--sunrise" in options) != ("--sunset" in options):
+            raise FsError("--sunrise and --sunset must be given together; the firmware "
+                          "discards one without the other")
+        sunrise = parse_minutes(options["--sunrise"]) if "--sunrise" in options else -1
+        sunset = parse_minutes(options["--sunset"]) if "--sunset" in options else -1
+        if sunrise >= 0 and sunrise >= sunset:
+            raise FsError("--sunrise must be earlier in the day than --sunset")
+
+        await self.device.send_weather_current(temperature, minimum, maximum, icon,
+                                               location, sunrise, sunset)
+        detail = f" ({minimum / 100:.1f} to {maximum / 100:.1f})" if minimum != maximum else ""
+        print(f"sent {temperature / 100:.1f} C{detail} for {location}")
 
     async def cmd_flash(self, args):
         """flash FILE
@@ -1271,7 +1791,8 @@ async def main_async(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Manage an InfiniTime watch over BLE: files, clock and firmware.",
+        description="Manage an InfiniTime watch over BLE: files, clock, sensors, "
+                    "notifications and firmware.",
         epilog="Run './infinitool.py -c help' for the command list.",
     )
     parser.add_argument("-n", "--name", default="InfiniTime", help="advertised name to match")

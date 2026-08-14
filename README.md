@@ -7,6 +7,8 @@ Bluetooth LE.  It provides the following functionality:
 - flash new firmware
 - view/update files ("external resources")
 - get/set time and date
+- read the sensors (battery, step count, accelerometer, heart rate)
+- send test notifications, alerts, music info and weather
 
 In short: it manages files, clock, and firmware, in a single connection.
 
@@ -69,11 +71,66 @@ Any command can also be run non-interactively using `-c`:
 Run `help` at the prompt for the command list — one line each — or `help COMMAND`
 (e.g. `help cp`) for the detail on any one of them.
 
+## Supported commands
+
+### Files
+
+| Command | What it does |
+|---|---|
+| `ls [-r] [PATH]` | List a directory, default `/`. `-r` descends into subdirectories. A `!` path lists this machine instead. |
+| `cp [-c\|-u] SRC DST` | Copy a file; exactly one side must be local (`!`). A `DST` ending in `/` keeps the source basename. Uploading a zip: `-c` copies the archive, `-u` unpacks it onto the watch. Uploads are verified afterwards by re-listing the parent directory. |
+| `rm [-R] PATH` | Delete a file on the watch. `-R` empties a directory first and then removes it, showing the count and asking before it starts. |
+| `mkdir PATH` | Create a directory on the watch. |
+| `df` | Show free space. |
+
+### Clock, identity and sensors
+
+| Command | What it does |
+|---|---|
+| `time [set]` | Show the watch clock, its drift from this machine, and its UTC offset; `time set` writes the time zone and clock from this machine. `date` is an alias. |
+| `info` | Everything readable in one go: firmware and model, battery, clock and drift, step count, the latest accelerometer sample, heart rate, filesystem version and free space, and the negotiated MTU. |
+
+The sensor values in `info` are read-only — InfiniTime exposes step count,
+accelerometer and heart rate as read/notify characteristics with no write path, so
+there is no way to set the step count over BLE. Heart rate reads back as "not
+measuring" unless the Heart Rate app is running on the watch (or continuous
+measurement is enabled in its settings).
+
+### Sending things to the watch
+
+| Command | What it does |
+|---|---|
+| `notify [-c CAT] TITLE [BODY]` | Send a notification. `CAT` defaults to `simple`; `call` raises the incoming-call screen instead. Title and body together may total 99 bytes. |
+| `alert [none\|mild\|high]` | Buzz the watch with an Immediate Alert (default `high`) — the quickest way to make it react. |
+| `music FIELD VALUE ...` | Populate the Music app: `track`, `artist`, `album` (text, 40 bytes each), `status` (play/pause), `position`, `length`, `number`, `total`, `speed`, `repeat`, `shuffle`. |
+| `weather TEMP [OPTIONS]` | Send current conditions for watchfaces that show weather. `weather forecast MIN/MAX/ICON ...` sends up to five days instead. |
+
+```
+infinitool> notify -c sms "Alice" "on my way"
+infinitool> alert mild
+infinitool> music track "Blue Monday" artist "New Order" status play length 450
+infinitool> weather 70F --min 55F --max 74F --icon rain --location Portland
+infinitool> weather forecast 12/19/rain 14/22/clouds-sun 15/24/sun
+```
+
+Weather temperatures are Celsius unless suffixed with `F`. The icon names are `sun`,
+`clouds-sun`, `clouds`, `broken-clouds`, `heavy-shower`, `rain`, `thunderstorm`,
+`snow` and `smog`; `--sunrise HH:MM` and `--sunset HH:MM` must be given as a pair, as
+the firmware discards one without the other.
+
+### Firmware and the shell itself
+
+| Command | What it does |
+|---|---|
+| `flash FILE` | Reflash from a `*-dfu-*.zip` package over Nordic legacy DFU, after confirming. The watch reboots, which ends the session. |
+| `help [COMMAND]` | List the commands, or explain one in full. |
+| `exit` | Quit; `quit` and Ctrl-D also work. |
+
 ## Files
 
 | | |
 |---|---|
-| `infinitool.py` | the tool: BLE filesystem, current time, device info, battery, `flash` |
+| `infinitool.py` | the tool: BLE filesystem, current time, device info, sensors, notifications, music, weather, `flash` |
 | `dfu_bleak.py`  | Nordic legacy DFU over bleak; also usable standalone |
 | `unpacker.py`   | unpacks a `*-dfu-*.zip` package (from ota-dfu-python) |
 
