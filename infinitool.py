@@ -86,6 +86,7 @@ import datetime
 import inspect
 import json
 import os
+import readline
 import shlex
 import struct
 import sys
