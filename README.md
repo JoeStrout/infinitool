@@ -78,7 +78,7 @@ Run `help` at the prompt for the command list — one line each — or `help COM
 | Command | What it does |
 |---|---|
 | `ls [-r] [PATH]` | List a directory, default `/`. `-r` descends into subdirectories. A `!` path lists this machine instead. |
-| `cp [-c\|-u] SRC DST` | Copy a file; exactly one side must be local (`!`). A `DST` ending in `/` keeps the source basename. Uploading a zip: `-c` copies the archive, `-u` unpacks it onto the watch. Uploads are verified afterwards by re-listing the parent directory. |
+| `cp [-c\|-u] SRC DST` | Copy a file; exactly one side must be local (`!`). A `DST` ending in `/` keeps the source basename. Uploading a zip: `-c` copies the archive, `-u` unpacks it onto the watch. Uploads are verified afterwards by reading back the file's size. |
 | `rm [-R] PATH` | Delete a file on the watch. `-R` empties a directory first and then removes it, showing the count and asking before it starts. |
 | `mkdir PATH` | Create a directory on the watch. |
 | `df` | Show free space. |

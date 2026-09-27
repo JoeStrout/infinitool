@@ -53,12 +53,18 @@ misleading errors in other clients:
     WRITE_DATA sets it ONLY on failure (FSService.cpp:185-198). WriteResponse has no
     default initialisers (FSService.h:120), so in each case the other path returns
     uninitialised stack memory. We therefore never trust status on data writes: uploads
-    are tracked by our own byte count and then VERIFIED by re-listing the parent
-    directory and comparing the file size.
+    are tracked by our own byte count and then VERIFIED by asking for the file's size
+    (a zero-length READ, which replies once with totallen) and comparing it.
   - Read and write chunks are not clamped to the connection MTU ("TODO add mtu somehow",
     FSService.cpp:111), so the client must size them or replies get truncated.
   - A directory listing ends with a terminator entry whose path_length is 0
     (FSService.cpp:292-296); it is not a file.
+  - A listing sends every entry as its own notification, all from inside the GATT
+    callback (FSService.cpp:257-290). The NimBLE host task is blocked meanwhile, so its
+    buffers are not freed, and past roughly 27 entries the rest -- terminator included --
+    are silently dropped. We stop once all `totalentries` have arrived, give up after a
+    short gap, and let `ls` show what did arrive. rm -R deletes what arrived and lists
+    again, until the directory is small enough to list whole.
   - Everything here is gated behind Settings -> "Firmware & files" on the watch. When it
     is Disabled, every request is refused and the version characteristic reads 0, not 4.
   - The Alert Notification write has a 3-byte header, but only byte 0 (the category) is
@@ -83,6 +89,7 @@ misleading errors in other clients:
 import argparse
 import asyncio
 import datetime
+import glob
 import inspect
 import json
 import os
@@ -239,6 +246,10 @@ WRITE_RESPONSE_HEADER = 20      # command, status, pad, offset, modTime, freespa
 WRITE_DATA_HEADER = 12          # command, status, pad, offset, dataSize
 LISTDIR_RESPONSE_HEADER = 28
 
+# Listing entries come about 100 ms apart (the vTaskDelay(100) in FSService.cpp:288), so
+# a gap this long after the first one means the rest were dropped, not delayed.
+LISTDIR_GAP_TIMEOUT = 2.0
+
 LFS_ERRORS = {
     0: "OK",
     -5: "IO — device operation failed",
@@ -285,6 +296,14 @@ Run 'help COMMAND' for more about one command.
 
 class FsError(Exception):
     pass
+
+
+class Listing(list):
+    """A directory's entries, plus how many the watch dropped (0 when complete)."""
+
+    def __init__(self, entries=(), missing=0):
+        super().__init__(entries)
+        self.missing = missing
 
 
 def describe_ble_error(exc):
@@ -463,16 +482,21 @@ class BleFs:
     async def start(self):
         await self.client.start_notify(UUID_TRANSFER, self._on_notify)
 
-    async def _response(self):
+    async def _response(self, timeout=None):
+        timeout = self.timeout if timeout is None else timeout
         try:
-            return await asyncio.wait_for(self.notifications.get(), self.timeout)
+            return await asyncio.wait_for(self.notifications.get(), timeout)
         except asyncio.TimeoutError:
             raise FsError(
-                f"no response within {self.timeout}s — check Settings -> "
+                f"no response within {timeout}s — check Settings -> "
                 "'Firmware & files' is Enabled on the watch"
             )
 
     async def _send(self, payload):
+        # Every reply to the previous request has been consumed by now, so anything still
+        # queued is a straggler (say, from a listing we gave up on) and would be misread.
+        while not self.notifications.empty():
+            self.log(f"discarding stale reply {self.notifications.get_nowait().hex()}")
         await self.client.write_gatt_char(UUID_TRANSFER, payload, response=True)
 
     async def version(self):
@@ -481,13 +505,37 @@ class BleFs:
 
     # -- listing -----------------------------------------------------------------
 
-    async def listdir(self, path):
+    async def listdir(self, path, allow_partial=False):
+        """Entries of a watch directory, without . and ..
+
+        Large directories lose entries in the firmware (see the notes at the top of this
+        file). With allow_partial, that returns what arrived, with the number lost in
+        .missing; otherwise it raises, for callers that would act wrongly on an
+        incomplete list.
+        """
         encoded = path.encode()
         await self._send(struct.pack("<BBH", CMD_LISTDIR, 0, len(encoded)) + encoded)
 
-        entries = []
+        entries = Listing()
+        seen = set()
+        total = None
+
+        def incomplete():
+            entries.missing = total - len(seen)
+            if not allow_partial:
+                raise FsError(
+                    f"{path}: the watch dropped {entries.missing} of {total} listing "
+                    "entries (a firmware limit on large directories)"
+                )
+            return entries
+
         while True:
-            data = await self._response()
+            try:
+                data = await self._response(None if total is None else LISTDIR_GAP_TIMEOUT)
+            except FsError:
+                if total is None:
+                    raise
+                return incomplete()
             if len(data) < LISTDIR_RESPONSE_HEADER:
                 raise FsError(f"short listdir response: {data.hex()}")
             (command, status, path_len, entry, total,
@@ -502,18 +550,40 @@ class BleFs:
                 errors="replace"
             )
             # Terminator entry, not a file (FSService.cpp:292-296).
-            if path_len and name not in (".", ".."):
-                entries.append({"name": name, "size": size, "is_dir": bool(flags & 1)})
-            if entry >= total:
+            if not path_len or entry >= total:
+                return entries if len(seen) >= total else incomplete()
+            if entry not in seen:
+                seen.add(entry)
+                if name not in (".", ".."):
+                    entries.append({"name": name, "size": size, "is_dir": bool(flags & 1)})
+            # Don't wait on the terminator: it is the likeliest entry to be dropped.
+            if len(seen) >= total:
                 return entries
 
     async def size_of(self, path):
-        """Size of a file on the watch, or None if absent. Used to verify uploads."""
-        parent, _, name = path.rpartition("/")
-        for item in await self.listdir(parent or "/"):
-            if item["name"] == name and not item["is_dir"]:
-                return item["size"]
-        return None
+        """Size of a file on the watch, or None if absent. Used to verify uploads.
+
+        A READ asking for zero bytes gets exactly one reply, carrying the size in
+        totallen, and the firmware opens and closes the file within that one request
+        (FSService.cpp:90-123). Unlike re-listing the parent, that works however full the
+        directory is. Files only: on a directory the firmware reads from a file it failed
+        to open.
+        """
+        encoded = path.encode()
+        await self._send(struct.pack("<BBHII", CMD_READ, 0, len(encoded), 0, 0) + encoded)
+        data = await self._response()
+        if len(data) < READ_RESPONSE_HEADER:
+            raise FsError(f"short read response: {data.hex()}")
+        command, status, _pad, _offset, totallen, _chunklen = struct.unpack_from(
+            "<BbHIII", data, 0
+        )
+        if command != CMD_READ_DATA:
+            raise FsError(f"unexpected reply 0x{command:02x} to read")
+        if status == -2:
+            return None
+        if status != STATUS_OK:
+            raise FsError(f"{path}: {describe_status(status)}")
+        return totallen
 
     # -- reading -----------------------------------------------------------------
 
@@ -598,7 +668,7 @@ class BleFs:
         # Because we cannot trust the status bytes, confirm the result independently.
         actual = await self.size_of(path)
         if actual is None:
-            raise FsError(f"upload finished but {path} is not in the directory listing")
+            raise FsError(f"upload finished but {path} is not on the watch")
         if actual != len(content):
             raise FsError(f"size mismatch: watch has {actual} bytes, sent {len(content)}")
         return actual
@@ -977,7 +1047,8 @@ class Shell:
         list a directory (default /)
 
         Sizes are in bytes; directories show a dash and a trailing /. With -r, descend
-        into subdirectories, indenting each level. A ! path lists this machine instead,
+        into subdirectories, indenting each level. The firmware drops entries from big
+        directories (past roughly 27); ls then warns and shows the ones that arrived. A ! path lists this machine instead,
         in the same format, and naming a local file just shows its size.
 
           ls /images                        on the watch
@@ -1001,9 +1072,15 @@ class Shell:
             yield item
 
     async def _ls(self, path, recursive, depth):
-        entries = await self.fs.listdir(path)
+        entries = await self.fs.listdir(path, allow_partial=True)
         if depth == 0:
             print(path)
+        if entries.missing:
+            print(
+                f"warning: the watch dropped {entries.missing} entries of {path} "
+                "(a firmware limit on large directories); showing the rest",
+                file=sys.stderr,
+            )
         for item in self._print_entries(entries, depth):
             if recursive and item["is_dir"]:
                 await self._ls(f"{path.rstrip('/')}/{item['name']}", recursive, depth + 1)
@@ -1036,14 +1113,16 @@ class Shell:
         copy a file; exactly one side must be local (!)
 
         The ! side says which direction this goes: watch-to-watch and local-to-local are
-        both refused. A DST ending in / (or, downloading, an existing local directory)
-        keeps the source basename. Uploads are verified afterwards by re-listing the
-        parent directory and comparing the size, because the firmware's own write status
-        cannot be trusted (see the notes at the top of this file).
+        both refused. Local upload sources may contain shell-style wildcards (*, ?, []);
+        multiple matches require DST to end in /. A DST ending in / (or, downloading, an
+        existing local directory) keeps the source basename. Uploads are verified
+        afterwards by reading back the file's size from the watch, because the firmware's
+        own write status cannot be trusted (see the notes at the top of this file).
 
           cp !fuji.bin /images/fuji.bin     upload
           cp /fonts/teko.bin !teko.bin      download
           cp !fuji.bin /images/             keep the local basename
+          cp !faces/*.bin /canvas/willie/   upload all matching local files
 
         Uploading a .zip can mean either of two things, so it asks which unless told:
         -c copies the archive itself to the watch, and -u unpacks it, writing the files
@@ -1087,7 +1166,27 @@ class Shell:
             raise FsError("-c and -u only apply to uploading a local .zip")
 
         if is_local(src):  # upload
-            source = local_path(src)
+            pattern = local_path(src)
+            has_magic = glob.has_magic(pattern)
+            if has_magic:
+                sources = [path for path in glob.glob(pattern) if os.path.isfile(path)]
+                if not sources:
+                    raise FsError(f"no local files match {pattern!r}")
+                if len(sources) > 1 and not dst.endswith("/"):
+                    raise FsError("multiple source files require DST ending in /")
+                if len(sources) > 1:
+                    for source in sorted(sources):
+                        target = dst + os.path.basename(source)
+                        with open(source, "rb") as handle:
+                            content = handle.read()
+                        print(f"{source} -> {target} ({len(content)} B)")
+                        written = await self.fs.write_file(target, content, progress)
+                        print(f"\n  verified {written} B on the watch")
+                    return
+                source = sources[0]
+            else:
+                source = pattern
+
             if zipfile.is_zipfile(source):
                 if mode is None:
                     mode = self.ask_zip_action()
@@ -1275,7 +1374,9 @@ class Shell:
         -R (or -r) empties a directory first and then removes it, walking it depth-first
         because lfs_remove only ever takes one entry at a time. That walk is also what
         makes it worth confirming: the count is shown before anything is deleted, and -y
-        answers yes. `rm -R /` is allowed, and empties the watch without removing the
+        answers yes. The firmware drops entries from big directories, so the walk may
+        not see everything at first; rm then deletes what it saw and walks again, as
+        many passes as it takes, until the directory lists completely. `rm -R /` is allowed, and empties the watch without removing the
         root itself, so think twice. Local paths are refused outright -- use your own
         shell for those.
 
@@ -1311,22 +1412,32 @@ class Shell:
             return
 
         path = "/" if is_root else path.rstrip("/")
-        files, dirs = await self._walk(path)
-        if not files and not dirs and is_root:
+        files, dirs, missing = await self._walk(path)
+        if not files and not dirs and not missing and is_root:
             print("/ is already empty")
             return
 
         count = f"{len(files)} file(s) and {len(dirs)} directory(ies)"
-        print(f"{path} holds {count}." if files or dirs else f"{path} is empty.")
+        if missing:
+            count += f", plus {missing} more entries the watch did not list"
+        print(f"{path} holds {count}." if files or dirs or missing else f"{path} is empty.")
         if not self.confirm(f"Delete {'everything under ' if is_root else ''}{path}?"):
             print("Cancelled.")
             return
 
-        # Depth-first: _walk already ordered the directories deepest-first, and every
-        # file goes before any directory, so nothing is ever removed while non-empty.
-        for target in files + dirs:
-            await self.fs.delete(target)
-            print(f"  deleted {target}")
+        while True:
+            # Depth-first: _walk already ordered the directories deepest-first, and every
+            # file goes before any directory, so nothing is ever removed while non-empty.
+            for target in files + dirs:
+                await self.fs.delete(target)
+                print(f"  deleted {target}")
+            if not missing:
+                break
+            # Each pass shrinks the directories, so their listings eventually fit.
+            print(f"  listing again for the {missing} entries the watch dropped")
+            files, dirs, missing = await self._walk(path)
+            if missing and not files and not dirs:
+                raise FsError(f"{path}: the watch keeps dropping entries; giving up")
         if is_root:
             print("emptied /")  # lfs has no way to remove the root itself
         else:
@@ -1334,32 +1445,50 @@ class Shell:
             print(f"deleted {path}")
 
     async def _is_dir(self, path):
-        """Ask the parent listing whether `path` is a directory. NOENT if it is absent."""
-        parent, _, name = path.rstrip("/").rpartition("/")
-        for item in await self.fs.listdir(parent or "/"):
-            if item["name"] == name:
-                return item["is_dir"]
-        raise FsError(f"{path}: {describe_status(-2)}")
+        """Whether `path` is a directory, by trying to list it. NOENT if it is absent.
+
+        Listing the path itself, rather than finding it in its parent's listing, works
+        even when the parent is too big to list completely: lfs_dir_open refuses a file
+        with NOTDIR before any entries are sent.
+        """
+        try:
+            await self.fs.listdir(path, allow_partial=True)
+        except FsError as exc:
+            if describe_status(-20) in str(exc):
+                return False
+            raise
+        return True
 
     async def _walk(self, path):
-        """Everything under `path`: (files, directories), directories deepest-first.
+        """Everything under `path`: (files, directories, missing), directories
+        deepest-first, with missing the number of entries the watch dropped.
 
         The order is the point -- it is what the caller deletes in, and lfs_remove
-        refuses a directory that still has anything in it.
+        refuses a directory that still has anything in it. For the same reason a
+        directory whose listing came back incomplete is left out of `directories`: it
+        still holds entries nobody has seen, so it waits for a later walk.
         """
         files, dirs = [], []
+        missing = 0
 
         async def visit(directory):
-            for item in await self.fs.listdir(directory):
+            """Walk one directory; True if it and everything under it listed fully."""
+            nonlocal missing
+            listing = await self.fs.listdir(directory, allow_partial=True)
+            missing += listing.missing
+            complete = not listing.missing
+            for item in listing:
                 child = f"{directory.rstrip('/')}/{item['name']}"
-                if item["is_dir"]:
-                    await visit(child)
+                if not item["is_dir"]:
+                    files.append(child)
+                elif await visit(child):
                     dirs.append(child)  # after its own children, so children go first
                 else:
-                    files.append(child)
+                    complete = False
+            return complete
 
         await visit(path)
-        return files, dirs
+        return files, dirs, missing
 
     async def cmd_mkdir(self, args):
         """mkdir PATH
